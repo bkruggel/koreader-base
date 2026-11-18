@@ -250,7 +250,17 @@ static void worker_render_job(fz_context *ctx, WorkerJob *job, fz_cookie *cookie
     fz_try(ctx) {
         pix = fz_new_pixmap_with_bbox_and_data(ctx, cs, job->bbox, NULL, job->alpha, job->bb_data);
         fz_clear_pixmap_with_value(ctx, pix, 0xff);
-        dev = fz_new_draw_device(ctx, job->ctm, pix);
+        /* The device transform MUST stay identity: the raster matrix travels
+         * ONLY via fz_run_display_list's top_ctm (the sync path, run_page in
+         * ffi/mupdf.lua, does the same with mupdf_new_draw_device(ctx, nil, ...)
+         * + fz_run_page(ctx, page, dev, ctm)). Passing job->ctm here as well
+         * double-applies it (the draw device concatenates dev->transform onto
+         * every op, c.f., fz_draw_fill_path_aux), throwing content off the
+         * pixmap for any job with a non-zero bbox origin — e.g., a viewport
+         * excerpt tile whose clip region starts at (size_x, size_y): the
+         * content lands at native*zoom² and is clipped out entirely (blank
+         * tile), or lands shifted for larger excerpts. */
+        dev = fz_new_draw_device(ctx, fz_identity, pix);
 
         if (job->transparency_mask) {
             fz_device *mask_dev = new_transparency_mask_device(ctx, dev);
