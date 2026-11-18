@@ -63,9 +63,12 @@ local function context()
     local ctx = save_ctx[1]
     if ctx then return ctx end
 
-    ctx = M.fz_new_context_imp(
+    -- mupdf_new_context creates the root context with real pthread locks
+    -- (instead of the single-threaded fz_locks_default fallback MuPDF
+    -- substitutes for NULL), making it clone-safe for the background
+    -- rasterization worker right from the start (c.f., mupdf_worker.c).
+    ctx = W.mupdf_new_context(
         mupdf.debug_memory and W.mupdf_get_my_alloc_context() or nil,
-        nil,
         mupdf.cache_size, FZ_VERSION)
 
     if ctx == nil then
@@ -1185,5 +1188,91 @@ function page_mt.__index:toBmp(bmp, dpi)
     W.mupdf_fz_bound_page(self.ctx, self.page, bounds)
     render_for_kopt(bmp, self, dpi/72, bounds, false)
 end
+
+--[[--
+Background rasterization worker (c.f., base/mupdf_worker.c).
+
+Enables asynchronous hinting: the main thread records an immutable display
+list (fz_new_display_list_from_page), a persistent worker thread then
+rasterizes it on a cloned context into a caller-provided buffer. Shared
+MuPDF resources (store, glyph cache, FreeType) are protected by pthread
+locks the root context is created with (mupdf_new_context in
+wrap-mupdf.c); clones inherit them.
+--]]
+mupdf.WORKER_IDLE = 0
+mupdf.WORKER_RUNNING = 1
+mupdf.WORKER_DONE = 2
+mupdf.WORKER_ERROR = 3
+mupdf.WORKER_ABORTED = 4
+
+-- Colorspace selectors for workerSubmit, mirroring draw_new()'s choices.
+mupdf.WORKER_CS_GRAY = 0
+mupdf.WORKER_CS_RGB = 1
+mupdf.WORKER_CS_BGR = 2
+
+--- Initialize the worker for the given (shared, process-wide) context.
+-- The context must have been created with mupdf_new_context (real locks).
+function mupdf.workerInit()
+    return W.mupdf_worker_init(context())
+end
+
+--- Record an immutable display list of the page (main thread only).
+-- Throws on MuPDF errors (like the other *render* entry points).
+function mupdf.newDisplayListFromPage(page)
+    local dlist = W.mupdf_new_display_list_from_page(page.ctx, page.page)
+    if dlist == nil then
+        merror(page.ctx, "cannot create display list")
+    end
+    return dlist
+end
+
+--- Compute the render matrix for a page area, mirroring draw_new().
+function mupdf.makeCTM(zoom, rotation, offset_x, offset_y)
+    local ctm = ffi.new("fz_matrix")
+    W.mupdf_fz_scale(ctm, zoom, zoom)
+    W.mupdf_fz_pre_rotate(ctm, rotation)
+    W.mupdf_fz_pre_translate(ctm, offset_x, offset_y)
+    return ctm
+end
+
+local function worker_colorspace(ctx, colorspace)
+    if colorspace == mupdf.WORKER_CS_RGB then
+        return M.fz_device_rgb(ctx)
+    elseif colorspace == mupdf.WORKER_CS_BGR then
+        return M.fz_device_bgr(ctx)
+    end
+    return M.fz_device_gray(ctx)
+end
+
+--- Apply MuPDF gamma correction to a BlitBuffer's pixels, in-place.
+-- Mirrors the fz_gamma_pixmap step of draw_new(). Only used by the
+-- synchronous paths: the background worker applies gamma (and saturation)
+-- itself, c.f., workerSubmit.
+function mupdf.applyGamma(bb, w, h, colorspace, alpha, gamma)
+    local ctx = context()
+    local cs = worker_colorspace(ctx, colorspace)
+    local bbox = ffi.new("fz_irect", 0, 0, w, h)
+    local pix = W.mupdf_new_pixmap_with_bbox_and_data(
+        ctx, cs, bbox, nil, alpha, ffi.cast("unsigned char*", bb.data))
+    if pix == nil then
+        merror(ctx, "cannot allocate pixmap for gamma")
+    end
+    M.fz_gamma_pixmap(ctx, pix, gamma)
+    M.fz_drop_pixmap(ctx, pix)
+end
+
+function mupdf.keepDisplayList(dlist)
+    return W.mupdf_keep_display_list(context(), dlist)
+end
+
+function mupdf.dropDisplayList(dlist)
+    W.mupdf_drop_display_list(context(), dlist)
+end
+mupdf.workerSubmit = W.mupdf_worker_submit
+mupdf.workerStatus = W.mupdf_worker_status
+mupdf.workerWait = W.mupdf_worker_wait
+mupdf.workerAbort = W.mupdf_worker_abort
+mupdf.workerShutdown = W.mupdf_worker_shutdown
+mupdf.pageHasTransparencyMask = W.mupdf_page_has_transparency_mask
 
 return mupdf
