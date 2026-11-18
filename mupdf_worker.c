@@ -320,17 +320,22 @@ static void *worker_thread_func(void *arg)
          * timeouts, pending-hint parking, poll races) that real devices
          * exhibit with multi-second jobs on a downclocked background core.
          * Sleeps WITHOUT holding the mutex, before any rendering: the job
-         * simply takes that long, exactly like the device. */
+         * simply takes that long, exactly like the device. The sleep is
+         * sliced so a cooperative abort (mupdf_worker_abort) lands during
+         * it, like it would during a long real render; the render call
+         * below then bails out at its first checkpoint. */
         {
             const char *delay_env = getenv("MUPDF_WORKER_DELAY_MS");
             if (delay_env != NULL) {
                 long delay_ms = atol(delay_env);
-                if (delay_ms > 0) {
+                while (delay_ms > 0 && !w->job.cookie.abort) {
+                    long slice_ms = delay_ms > 20 ? 20 : delay_ms;
                     struct timespec ts = {
-                        delay_ms / 1000,
-                        (delay_ms % 1000) * 1000000L,
+                        slice_ms / 1000,
+                        (slice_ms % 1000) * 1000000L,
                     };
                     nanosleep(&ts, NULL);
+                    delay_ms -= slice_ms;
                 }
             }
         }
