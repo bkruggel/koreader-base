@@ -58,6 +58,20 @@ end
 
 local save_ctx = setmetatable({}, {__mode="kv"})
 
+-- Strong reference to the root fz_context held while the background worker
+-- is initialized (see mupdf.workerInit / mupdf.workerShutdown below).
+local worker_pinned_ctx = nil
+
+-- Ensure the background worker is not actively reading pdf_document streams
+-- before any main-thread document operation (openPage, getToc, writeDocument,
+-- layoutDocument). Cheap when idle; prevents concurrent pdf_document access.
+local function ensure_worker_idle()
+    if worker_pinned_ctx and W.mupdf_worker_status() == mupdf.WORKER_RUNNING then
+        W.mupdf_worker_abort()
+        W.mupdf_worker_wait(-1)
+    end
+end
+
 -- provides an fz_context for mupdf
 local function context()
     local ctx = save_ctx[1]
@@ -225,6 +239,7 @@ function document_mt.__index:isDocumentReflowable()
 end
 
 function document_mt.__index:layoutDocument(width, height, em)
+    ensure_worker_idle()
     -- Reset the cache.
     self.number_of_pages = nil
 
@@ -261,6 +276,7 @@ Returns a table like this:
 Returns an empty table when there is no ToC
 --]]
 function document_mt.__index:getToc()
+    ensure_worker_idle()
     local toc = {}
     local outline = W.mupdf_load_outline(self.ctx, self.doc)
     if outline ~= nil then
@@ -274,6 +290,7 @@ end
 open a page, return page object
 --]]
 function document_mt.__index:openPage(number)
+    ensure_worker_idle()
     local ctx = self.ctx
     local mupdf_page = {
         page = W.mupdf_load_page(ctx, self.doc, number-1),
@@ -354,6 +371,7 @@ end
 write the document to a new file
 --]]
 function document_mt.__index:writeDocument(filename)
+    ensure_worker_idle()
     local opts = ffi.new("pdf_write_options")
     opts.do_incremental = (filename == self.filename ) and 1 or 0
     opts.do_ascii = 0
@@ -1213,7 +1231,26 @@ mupdf.WORKER_CS_BGR = 2
 --- Initialize the worker for the given (shared, process-wide) context.
 -- The context must have been created with mupdf_new_context (real locks).
 function mupdf.workerInit()
-    return W.mupdf_worker_init(context())
+    local ctx = context()
+    local ret = W.mupdf_worker_init(ctx)
+    if ret == 0 and not worker_pinned_ctx then
+        -- Keep the root fz_context (and its weak save_ctx[1] entry) alive for
+        -- the worker's lifetime: closing PDF #1 and opening PDF #2 triggers a
+        -- GC sweep that would otherwise drop main_ctx while g_worker stays
+        -- initialized, leaving g_worker.main_ctx dangling.
+        worker_pinned_ctx = keep_context(ctx)
+    end
+    return ret
+end
+
+--- Shut down the worker thread and release the pinned root context.
+function mupdf.workerShutdown()
+    W.mupdf_worker_shutdown()
+    if worker_pinned_ctx then
+        local ctx = worker_pinned_ctx
+        worker_pinned_ctx = nil
+        drop_context(ctx)
+    end
 end
 
 --- Record an immutable display list of the page (main thread only).
@@ -1272,7 +1309,6 @@ mupdf.workerSubmit = W.mupdf_worker_submit
 mupdf.workerStatus = W.mupdf_worker_status
 mupdf.workerWait = W.mupdf_worker_wait
 mupdf.workerAbort = W.mupdf_worker_abort
-mupdf.workerShutdown = W.mupdf_worker_shutdown
 mupdf.pageHasTransparencyMask = W.mupdf_page_has_transparency_mask
 
 return mupdf
