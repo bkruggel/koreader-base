@@ -58,13 +58,11 @@ end
 
 local save_ctx = setmetatable({}, {__mode="kv"})
 
--- Strong reference to the root fz_context held while the background worker
--- is initialized (see mupdf.workerInit / mupdf.workerShutdown below).
+-- Strong reference to the root fz_context held while the background worker is initialized.
 local worker_pinned_ctx = nil
 
--- Ensure the background worker is not actively reading pdf_document streams
--- before any main-thread document operation (openPage, getToc, writeDocument,
--- layoutDocument). Cheap when idle; prevents concurrent pdf_document access.
+-- Abort and wait for any running background rasterization job before main-thread
+-- document operations that touch pdf_document streams.
 local function ensure_worker_idle()
     if worker_pinned_ctx and W.mupdf_worker_status() == mupdf.WORKER_RUNNING then
         W.mupdf_worker_abort()
@@ -77,10 +75,8 @@ local function context()
     local ctx = save_ctx[1]
     if ctx then return ctx end
 
-    -- mupdf_new_context creates the root context with real pthread locks
-    -- (instead of the single-threaded fz_locks_default fallback MuPDF
-    -- substitutes for NULL), making it clone-safe for the background
-    -- rasterization worker right from the start (c.f., mupdf_worker.c).
+    -- Create the root context with real pthread locks (instead of MuPDF's single-threaded
+    -- fz_locks_default fallback) so it can be cloned safely by mupdf_worker.c.
     ctx = W.mupdf_new_context(
         mupdf.debug_memory and W.mupdf_get_my_alloc_context() or nil,
         mupdf.cache_size, FZ_VERSION)
@@ -1207,37 +1203,25 @@ function page_mt.__index:toBmp(bmp, dpi)
     render_for_kopt(bmp, self, dpi/72, bounds, false)
 end
 
---[[--
-Background rasterization worker (c.f., base/mupdf_worker.c).
-
-Enables asynchronous hinting: the main thread records an immutable display
-list (fz_new_display_list_from_page), a persistent worker thread then
-rasterizes it on a cloned context into a caller-provided buffer. Shared
-MuPDF resources (store, glyph cache, FreeType) are protected by pthread
-locks the root context is created with (mupdf_new_context in
-wrap-mupdf.c); clones inherit them.
---]]
+-- Background rasterization worker (mupdf_worker.c)
 mupdf.WORKER_IDLE = 0
 mupdf.WORKER_RUNNING = 1
 mupdf.WORKER_DONE = 2
 mupdf.WORKER_ERROR = 3
 mupdf.WORKER_ABORTED = 4
 
--- Colorspace selectors for workerSubmit, mirroring draw_new()'s choices.
 mupdf.WORKER_CS_GRAY = 0
 mupdf.WORKER_CS_RGB = 1
 mupdf.WORKER_CS_BGR = 2
 
---- Initialize the worker for the given (shared, process-wide) context.
--- The context must have been created with mupdf_new_context (real locks).
+--- Initialize the background rasterization worker.
+-- @treturn int 0 on success
 function mupdf.workerInit()
     local ctx = context()
     local ret = W.mupdf_worker_init(ctx)
     if ret == 0 and not worker_pinned_ctx then
-        -- Keep the root fz_context (and its weak save_ctx[1] entry) alive for
-        -- the worker's lifetime: closing PDF #1 and opening PDF #2 triggers a
-        -- GC sweep that would otherwise drop main_ctx while g_worker stays
-        -- initialized, leaving g_worker.main_ctx dangling.
+        -- Pin the root context so LuaJIT GC cannot collect save_ctx[1] between
+        -- documents while g_worker remains initialized.
         worker_pinned_ctx = keep_context(ctx)
     end
     return ret
@@ -1254,7 +1238,8 @@ function mupdf.workerShutdown()
 end
 
 --- Record an immutable display list of the page (main thread only).
--- Throws on MuPDF errors (like the other *render* entry points).
+-- @tparam table page MuPDF page wrapper
+-- @treturn cdata fz_display_list*
 function mupdf.newDisplayListFromPage(page)
     local dlist = W.mupdf_new_display_list_from_page(page.ctx, page.page)
     if dlist == nil then
@@ -1263,7 +1248,12 @@ function mupdf.newDisplayListFromPage(page)
     return dlist
 end
 
---- Compute the render matrix for a page area, mirroring draw_new().
+--- Compute the raster matrix for a page area, matching draw_new().
+-- @tparam number zoom
+-- @tparam number rotation
+-- @tparam number offset_x
+-- @tparam number offset_y
+-- @treturn cdata fz_matrix
 function mupdf.makeCTM(zoom, rotation, offset_x, offset_y)
     local ctm = ffi.new("fz_matrix")
     W.mupdf_fz_scale(ctm, zoom, zoom)
@@ -1275,6 +1265,7 @@ end
 function mupdf.dropDisplayList(dlist)
     W.mupdf_drop_display_list(context(), dlist)
 end
+
 mupdf.workerSubmit = W.mupdf_worker_submit
 mupdf.workerStatus = W.mupdf_worker_status
 mupdf.workerWait = W.mupdf_worker_wait

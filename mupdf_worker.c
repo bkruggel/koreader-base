@@ -19,29 +19,26 @@
 /*
     Background rasterization worker for MuPDF display lists.
 
-    MuPDF is not thread-safe for document/page access, but it explicitly
-    supports a two-stage pipeline:
+    MuPDF is not thread-safe for document/page access, but supports a
+    two-stage pipeline:
       1. Main thread: fz_new_display_list_from_page() records an immutable
          display list (parsing only, no rasterization).
       2. Worker thread: fz_run_display_list() on a cloned context
          (fz_clone_context) rasterizes it into a caller-provided buffer.
 
-    Shared resources (the store, the glyph cache, FreeType) are protected
-    by client-provided locks. The main context is created with pthread
-    locks right away by wrap-mupdf.c's mupdf_new_context(), so contexts
-    (and clones) are always safe for concurrent use, following the
-    pattern of MuPDF's own multi-threaded example.
+    Shared resources (store, glyph cache, FreeType) are protected by the
+    client-provided pthread locks installed on the root context in
+    wrap-mupdf.c (mupdf_new_context); cloned contexts inherit them.
 
     Contract:
-      - mupdf_worker_init() must be called once, from the main thread,
-        before any concurrent MuPDF use.
-      - The display list handed to mupdf_worker_submit() must stay alive
-        until the job leaves the RUNNING state; submit takes its own
-        reference and drops it when the job finishes.
-      - The destination buffer is owned by the caller, which is
-        responsible for keeping it alive (and unreferenced by anyone else)
-        until the job finishes.
-      - Only one job may be in flight; a submit while RUNNING returns busy.
+      - mupdf_worker_init() must be called once from the main thread before
+        any concurrent MuPDF use.
+      - The display list passed to mupdf_worker_submit() must stay valid
+        until submit returns; submit takes its own reference and drops it
+        when the job finishes.
+      - The caller owns the destination buffer and must keep it alive (and
+        untouched) until the job leaves WORKER_RUNNING.
+      - Only one job may be in flight at a time; submit returns -1 while busy.
 */
 
 #include <math.h>
@@ -105,19 +102,12 @@ static MuPdfWorker g_worker = {
 };
 
 /*
-    Client-provided lock functions for the shared MuPDF context live in
-    wrap-mupdf.c (mupdf_new_context), which creates the root context with
-    them from the start; clones made here inherit the very same locks.
-*/
-
-/*
     Transparency mask passthrough device, replicating wrap-mupdf.c's
     new_transparency_mask_device(): pages with soft masks must not have
     their background clobbered by the explicit clear, so we forward only
-    image-mask fills to the real draw device. The page-level *check*
-    (page_has_transparency_mask) happens on the main thread at submit
-    time; this device only touches the draw device stack, which is
-    worker-local.
+    image-mask fills to the real draw device. The page-level check
+    (page_has_transparency_mask) runs on the main thread at submit time;
+    this device only touches the worker-local draw device stack.
 */
 static void transparency_mask_close_device(fz_context *ctx, fz_device *dev)
 {
@@ -160,10 +150,9 @@ static fz_colorspace *worker_colorspace(fz_context *ctx, int colorspace)
 }
 
 /*
-    Post-processing steps normally done by the caller right after drawing
-    (c.f., page_mt.draw_new in ffi/mupdf.lua): gamma correction through
-    fz_gamma_pixmap, then luma-preserving saturation. Running them here
-    keeps arbitrarily large buffers off the UI thread.
+    Post-processing steps matching page_mt:draw_new() in ffi/mupdf.lua:
+    gamma correction followed by luma-preserving saturation. Running them
+    here keeps full-buffer passes off the UI thread.
 */
 
 static inline uint8_t worker_saturate_channel(uint8_t channel, uint8_t gray, double saturation)
@@ -178,17 +167,15 @@ static inline uint8_t worker_saturate_channel(uint8_t channel, uint8_t gray, dou
     return (uint8_t)(value + 0.5);
 }
 
-/* Replicates blitbuffer.c's BB_saturate_rect BBRGB32 path on the pixmap's
- * raw samples (grayscale and monochrome buffers, n < 3, have no saturation).
- * Checks cookie->abort every 64 scanlines so an obsolete job is abandoned
- * promptly instead of finishing a doomed full-buffer pass. */
+/* Replicates blitbuffer.c's BB_saturate_rect BBRGB32 path on raw pixmap
+ * samples (grayscale buffers, n < 3, have no saturation). Polls
+ * cookie->abort every 64 scanlines so cancelled jobs exit promptly. */
 static void worker_saturate_pixmap(fz_context *ctx, fz_pixmap *pix, double saturation, fz_cookie *cookie)
 {
     if (pix->n < 3) {
         return;
     }
-    /* Component order follows the colorspace: RGB gives r,g,b; BGR gives
-     * b,g,r — green is always the second sample. */
+    /* RGB gives r,g,b; BGR gives b,g,r; green is always at offset 1. */
     const int r_off = pix->colorspace == fz_device_bgr(ctx) ? 2 : 0;
     const int b_off = 2 - r_off;
     for (int y = 0; y < pix->h; y++) {
@@ -209,10 +196,8 @@ static void worker_saturate_pixmap(fz_context *ctx, fz_pixmap *pix, double satur
     }
 }
 
-/* Row-wise replica of fz_gamma_pixmap (source/fitz/pixmap.c): a 256-entry
- * LUT applied to every non-alpha component. Reimplemented locally so the
- * scan can check cookie->abort every 64 scanlines like the saturation pass
- * (fz_gamma_pixmap itself is monolithic and not abortable). */
+/* Row-wise replica of fz_gamma_pixmap (source/fitz/pixmap.c) that checks
+ * cookie->abort every 64 scanlines (fz_gamma_pixmap itself is monolithic). */
 static void worker_gamma_pixmap(fz_pixmap *pix, float gamma, fz_cookie *cookie)
 {
     unsigned char gamma_map[256];
@@ -237,9 +222,8 @@ static void worker_gamma_pixmap(fz_pixmap *pix, float gamma, fz_cookie *cookie)
     }
 }
 
-/* cookie points at the SHARED in-flight job's cookie, so aborts requested
- * by the main thread are honored mid-job (the local job copy below is not
- * updated by mupdf_worker_abort). */
+/* cookie points at the shared in-flight job's cookie so main-thread
+ * mupdf_worker_abort() calls are observed mid-job. */
 static void worker_render_job(fz_context *ctx, WorkerJob *job, fz_cookie *cookie)
 {
     fz_colorspace *cs = worker_colorspace(ctx, job->colorspace);
@@ -249,9 +233,9 @@ static void worker_render_job(fz_context *ctx, WorkerJob *job, fz_cookie *cookie
     fz_try(ctx) {
         pix = fz_new_pixmap_with_bbox_and_data(ctx, cs, job->bbox, NULL, job->alpha, job->bb_data);
         fz_clear_pixmap_with_value(ctx, pix, 0xff);
-        /* The device transform stays identity: the raster matrix travels
-         * only via fz_run_display_list's top_ctm (mirroring run_page in
-         * ffi/mupdf.lua), while the pixmap bbox anchors the excerpt origin. */
+        /* Keep the draw device transform identity: the raster matrix travels
+         * via fz_run_display_list's top_ctm (matching run_page in ffi/mupdf.lua),
+         * while the pixmap bbox anchors the excerpt origin. */
         dev = fz_new_draw_device(ctx, fz_identity, pix);
 
         if (job->transparency_mask) {
@@ -299,11 +283,6 @@ static void *worker_thread_func(void *arg)
         }
 
         WorkerJob job = w->job;
-        /* The render watches the SHARED job's cookie (mupdf_worker_abort()
-         * writes it under the mutex), so cancellation lands at the next
-         * progress step or scanline checkpoint. Reading the plain flag
-         * without holding the mutex mirrors MuPDF's own cookie usage in
-         * its threaded examples. */
         fz_cookie *cookie = &w->job.cookie;
         pthread_mutex_unlock(&w->mutex);
 
@@ -318,9 +297,8 @@ static void *worker_thread_func(void *arg)
             result = cookie->abort ? WORKER_ABORTED : WORKER_ERROR;
         }
 
-        /* Release the reference taken at submit time using the worker's own
-         * cloned context (fz_context is strictly single-threaded in MuPDF;
-         * passing main_ctx here races with main-thread MuPDF calls). */
+        /* Release the display list reference using the worker's cloned context
+         * (fz_context is single-threaded; main_ctx belongs to the UI thread). */
         fz_drop_display_list(w->worker_ctx, job.list);
 
         pthread_mutex_lock(&w->mutex);
@@ -342,8 +320,8 @@ WORKER_PUBLIC int mupdf_worker_init(fz_context *main_ctx)
         return 0;
     }
 
-    /* The main context already carries real pthread locks (installed at
-     * creation time by mupdf_new_context), so it can be cloned. */
+    /* main_ctx was created with real pthread locks in mupdf_new_context(),
+     * so fz_clone_context() is safe here. */
     g_worker.main_ctx = main_ctx;
     g_worker.worker_ctx = fz_clone_context(main_ctx);
     if (g_worker.worker_ctx == NULL) {
@@ -413,9 +391,9 @@ WORKER_PUBLIC void mupdf_worker_abort(void)
 }
 
 /*
-    Wait for the in-flight job to leave the RUNNING state.
-    timeout_ms < 0 waits indefinitely; otherwise it is a bounded wait in
-    milliseconds. Returns the resulting state.
+    Wait for the in-flight job to leave WORKER_RUNNING.
+    timeout_ms < 0 waits indefinitely; otherwise performs a bounded wait
+    in milliseconds. Returns the resulting state.
 */
 WORKER_PUBLIC int mupdf_worker_wait(int timeout_ms)
 {
