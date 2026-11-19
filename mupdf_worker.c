@@ -43,6 +43,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -91,6 +92,8 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond_start;
     pthread_cond_t cond_done;
+    clockid_t wait_clock;
+    int cond_done_initialized;
     int shutdown;
     int initialized;
 } MuPdfWorker;
@@ -99,6 +102,7 @@ static MuPdfWorker g_worker = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .cond_start = PTHREAD_COND_INITIALIZER,
     .cond_done = PTHREAD_COND_INITIALIZER,
+    .wait_clock = CLOCK_REALTIME,
 };
 
 /*
@@ -155,21 +159,21 @@ static fz_colorspace *worker_colorspace(fz_context *ctx, int colorspace)
     here keeps full-buffer passes off the UI thread.
 */
 
-static inline uint8_t worker_saturate_channel(uint8_t channel, uint8_t gray, double saturation)
+static inline uint8_t worker_clamp_u8(int32_t value)
 {
-    double value = (double)gray + (((double)channel - (double)gray) * saturation);
-    if (value <= 0.0) {
+    if (value <= 0) {
         return 0;
     }
-    if (value >= 255.0) {
+    if (value >= 255) {
         return 255;
     }
-    return (uint8_t)(value + 0.5);
+    return (uint8_t)value;
 }
 
 /* Replicates blitbuffer.c's BB_saturate_rect BBRGB32 path on raw pixmap
- * samples (grayscale buffers, n < 3, have no saturation). Polls
- * cookie->abort every 64 scanlines so cancelled jobs exit promptly. */
+ * samples (grayscale buffers, n < 3, have no saturation) using 8-bit
+ * fixed-point arithmetic. Polls cookie->abort every 64 scanlines so
+ * cancelled jobs exit promptly. */
 static void worker_saturate_pixmap(fz_context *ctx, fz_pixmap *pix, double saturation, fz_cookie *cookie)
 {
     if (pix->n < 3) {
@@ -178,6 +182,7 @@ static void worker_saturate_pixmap(fz_context *ctx, fz_pixmap *pix, double satur
     /* RGB gives r,g,b; BGR gives b,g,r; green is always at offset 1. */
     const int r_off = pix->colorspace == fz_device_bgr(ctx) ? 2 : 0;
     const int b_off = 2 - r_off;
+    const int32_t sat_fp = (int32_t)lround(saturation * 256.0);
     for (int y = 0; y < pix->h; y++) {
         if ((y & 63) == 0 && cookie->abort) {
             return;
@@ -185,13 +190,13 @@ static void worker_saturate_pixmap(fz_context *ctx, fz_pixmap *pix, double satur
         unsigned char *row = pix->samples + (size_t)y * pix->stride;
         for (int x = 0; x < pix->w; x++) {
             unsigned char *px = row + (size_t)x * pix->n;
-            const uint8_t r = px[r_off];
-            const uint8_t g = px[1];
-            const uint8_t b = px[b_off];
-            const uint8_t gray = (uint8_t)((4898U * r + 9618U * g + 1869U * b) >> 14U);
-            px[r_off] = worker_saturate_channel(r, gray, saturation);
-            px[1] = worker_saturate_channel(g, gray, saturation);
-            px[b_off] = worker_saturate_channel(b, gray, saturation);
+            const int32_t r = px[r_off];
+            const int32_t g = px[1];
+            const int32_t b = px[b_off];
+            const int32_t gray = (int32_t)((4898U * (uint32_t)r + 9618U * (uint32_t)g + 1869U * (uint32_t)b) >> 14U);
+            px[r_off] = worker_clamp_u8(gray + (((r - gray) * sat_fp + 128) >> 8));
+            px[1] = worker_clamp_u8(gray + (((g - gray) * sat_fp + 128) >> 8));
+            px[b_off] = worker_clamp_u8(gray + (((b - gray) * sat_fp + 128) >> 8));
         }
     }
 }
@@ -320,6 +325,20 @@ WORKER_PUBLIC int mupdf_worker_init(fz_context *main_ctx)
         return 0;
     }
 
+#if !defined(__APPLE__) && defined(CLOCK_MONOTONIC)
+    if (!g_worker.cond_done_initialized) {
+        pthread_condattr_t attr;
+        if (pthread_condattr_init(&attr) == 0) {
+            if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0
+                    && pthread_cond_init(&g_worker.cond_done, &attr) == 0) {
+                g_worker.wait_clock = CLOCK_MONOTONIC;
+                g_worker.cond_done_initialized = 1;
+            }
+            pthread_condattr_destroy(&attr);
+        }
+    }
+#endif
+
     /* main_ctx was created with real pthread locks in mupdf_new_context(),
      * so fz_clone_context() is safe here. */
     g_worker.main_ctx = main_ctx;
@@ -405,7 +424,7 @@ WORKER_PUBLIC int mupdf_worker_wait(int timeout_ms)
             }
         } else {
             struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
+            clock_gettime(g_worker.wait_clock, &ts);
             ts.tv_nsec += (long)timeout_ms * 1000000L;
             while (ts.tv_nsec >= 1000000000L) {
                 ts.tv_sec += 1;
