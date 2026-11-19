@@ -46,8 +46,7 @@
 
 #include <math.h>
 #include <pthread.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdio.h>
 #include <time.h>
 
 #include <mupdf/fitz.h>
@@ -250,16 +249,9 @@ static void worker_render_job(fz_context *ctx, WorkerJob *job, fz_cookie *cookie
     fz_try(ctx) {
         pix = fz_new_pixmap_with_bbox_and_data(ctx, cs, job->bbox, NULL, job->alpha, job->bb_data);
         fz_clear_pixmap_with_value(ctx, pix, 0xff);
-        /* The device transform MUST stay identity: the raster matrix travels
-         * ONLY via fz_run_display_list's top_ctm (the sync path, run_page in
-         * ffi/mupdf.lua, does the same with mupdf_new_draw_device(ctx, nil, ...)
-         * + fz_run_page(ctx, page, dev, ctm)). Passing job->ctm here as well
-         * double-applies it (the draw device concatenates dev->transform onto
-         * every op, c.f., fz_draw_fill_path_aux), throwing content off the
-         * pixmap for any job with a non-zero bbox origin — e.g., a viewport
-         * excerpt tile whose clip region starts at (size_x, size_y): the
-         * content lands at native*zoom² and is clipped out entirely (blank
-         * tile), or lands shifted for larger excerpts. */
+        /* The device transform stays identity: the raster matrix travels
+         * only via fz_run_display_list's top_ctm (mirroring run_page in
+         * ffi/mupdf.lua), while the pixmap bbox anchors the excerpt origin. */
         dev = fz_new_draw_device(ctx, fz_identity, pix);
 
         if (job->transparency_mask) {
@@ -314,31 +306,6 @@ static void *worker_thread_func(void *arg)
          * its threaded examples. */
         fz_cookie *cookie = &w->job.cookie;
         pthread_mutex_unlock(&w->mutex);
-
-        /* TEST KNOB (device-latency replication): optional per-job delay so
-         * desktop runs can exercise the slow-worker paths (coalescing
-         * timeouts, pending-hint parking, poll races) that real devices
-         * exhibit with multi-second jobs on a downclocked background core.
-         * Sleeps WITHOUT holding the mutex, before any rendering: the job
-         * simply takes that long, exactly like the device. The sleep is
-         * sliced so a cooperative abort (mupdf_worker_abort) lands during
-         * it, like it would during a long real render; the render call
-         * below then bails out at its first checkpoint. */
-        {
-            const char *delay_env = getenv("MUPDF_WORKER_DELAY_MS");
-            if (delay_env != NULL) {
-                long delay_ms = atol(delay_env);
-                while (delay_ms > 0 && !w->job.cookie.abort) {
-                    long slice_ms = delay_ms > 20 ? 20 : delay_ms;
-                    struct timespec ts = {
-                        slice_ms / 1000,
-                        (slice_ms % 1000) * 1000000L,
-                    };
-                    nanosleep(&ts, NULL);
-                    delay_ms -= slice_ms;
-                }
-            }
-        }
 
         WorkerState result = WORKER_DONE;
         fz_try(w->worker_ctx) {

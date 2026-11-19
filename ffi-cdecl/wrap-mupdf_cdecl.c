@@ -152,7 +152,6 @@ cdecl_func(fz_drop_device)
 /* display lists & background rasterization worker */
 cdecl_type(fz_display_list)
 cdecl_func(mupdf_new_display_list_from_page)
-cdecl_func(mupdf_keep_display_list)
 cdecl_func(mupdf_drop_display_list)
 cdecl_func(mupdf_worker_init)
 cdecl_func(mupdf_worker_submit)

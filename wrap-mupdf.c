@@ -160,10 +160,8 @@ int mupdf_get_cache_size() {
     Client-provided locks for the shared MuPDF context, so that the root
     context is created thread-safe from the start (and can therefore be
     cloned by the background rasterization worker, c.f., mupdf_worker.c).
-    The mutexes are initialized once and live for the whole process: the
-    worker's cloned context shares this exact fz_locks_context, and clones
-    may outlive a dropped root context (the worker is never shut down
-    before process exit).
+    The mutexes are initialized once and live for the whole process so the
+    worker's cloned context shares this exact fz_locks_context.
 */
 static pthread_mutex_t mupdf_ctx_locks[FZ_LOCK_MAX];
 static int mupdf_ctx_locks_initialized = 0;
@@ -249,10 +247,6 @@ fz_rect *mupdf_fz_rect_from_quad(fz_rect *r, const fz_quad *q) {
 fz_rect *mupdf_fz_bound_page(fz_context *ctx, fz_page *page, fz_rect *r) {
     *r = fz_bound_page(ctx, page);
     return r;
-}
-
-fz_display_list *mupdf_keep_display_list(fz_context *ctx, fz_display_list *list) {
-    return fz_keep_display_list(ctx, list);
 }
 
 void mupdf_drop_display_list(fz_context *ctx, fz_display_list *list) {

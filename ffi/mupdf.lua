@@ -1272,36 +1272,6 @@ function mupdf.makeCTM(zoom, rotation, offset_x, offset_y)
     return ctm
 end
 
-local function worker_colorspace(ctx, colorspace)
-    if colorspace == mupdf.WORKER_CS_RGB then
-        return M.fz_device_rgb(ctx)
-    elseif colorspace == mupdf.WORKER_CS_BGR then
-        return M.fz_device_bgr(ctx)
-    end
-    return M.fz_device_gray(ctx)
-end
-
---- Apply MuPDF gamma correction to a BlitBuffer's pixels, in-place.
--- Mirrors the fz_gamma_pixmap step of draw_new(). Only used by the
--- synchronous paths: the background worker applies gamma (and saturation)
--- itself, c.f., workerSubmit.
-function mupdf.applyGamma(bb, w, h, colorspace, alpha, gamma)
-    local ctx = context()
-    local cs = worker_colorspace(ctx, colorspace)
-    local bbox = ffi.new("fz_irect", 0, 0, w, h)
-    local pix = W.mupdf_new_pixmap_with_bbox_and_data(
-        ctx, cs, bbox, nil, alpha, ffi.cast("unsigned char*", bb.data))
-    if pix == nil then
-        merror(ctx, "cannot allocate pixmap for gamma")
-    end
-    M.fz_gamma_pixmap(ctx, pix, gamma)
-    M.fz_drop_pixmap(ctx, pix)
-end
-
-function mupdf.keepDisplayList(dlist)
-    return W.mupdf_keep_display_list(context(), dlist)
-end
-
 function mupdf.dropDisplayList(dlist)
     W.mupdf_drop_display_list(context(), dlist)
 end

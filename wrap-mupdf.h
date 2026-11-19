@@ -45,9 +45,8 @@ DLL_PUBLIC fz_rect *mupdf_fz_union_rect(fz_rect *a, const fz_rect *b);
 DLL_PUBLIC fz_rect *mupdf_fz_rect_from_quad(fz_rect *r, const fz_quad *q);
 DLL_PUBLIC fz_rect *mupdf_fz_bound_page(fz_context *ctx, fz_page *page, fz_rect *r);
 
-// Display list reference management (fz_*_display_list are hidden by the
-// MuPDF visibility whitelist, so we re-export thin wrappers).
-DLL_PUBLIC fz_display_list *mupdf_keep_display_list(fz_context *ctx, fz_display_list *list);
+// Display list release wrapper (fz_drop_display_list is hidden by the
+// MuPDF visibility whitelist, so we re-export a thin wrapper).
 DLL_PUBLIC void mupdf_drop_display_list(fz_context *ctx, fz_display_list *list);
 
 // Background rasterization worker (mupdf_worker.c)
@@ -232,4 +231,3 @@ MUPDF_WRAP(mupdf_new_image_from_buffer, fz_image*, NULL,
 MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
     ret = fz_new_buffer_from_shared_data(ctx, data, size),
     const unsigned char *data, size_t size)
-
