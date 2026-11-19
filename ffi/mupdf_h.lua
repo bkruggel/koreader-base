@@ -246,7 +246,6 @@ bool mupdf_close_device(fz_context *, fz_device *);
 void fz_drop_device(fz_context *, fz_device *);
 typedef struct fz_display_list fz_display_list;
 fz_display_list *mupdf_new_display_list_from_page(fz_context *, fz_page *);
-fz_display_list *mupdf_keep_display_list(fz_context *, fz_display_list *);
 void mupdf_drop_display_list(fz_context *, fz_display_list *);
 int mupdf_worker_init(fz_context *);
 int mupdf_worker_submit(fz_display_list *, const fz_matrix *, const fz_rect *, const fz_irect *, unsigned char *, int, int, int, int, float, float);
