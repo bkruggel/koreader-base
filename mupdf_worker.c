@@ -106,7 +106,7 @@ static MuPdfWorker g_worker = {
 };
 
 /*
-    Client-provided locks for the shared MuPDF context live in
+    Client-provided lock functions for the shared MuPDF context live in
     wrap-mupdf.c (mupdf_new_context), which creates the root context with
     them from the start; clones made here inherit the very same locks.
 */
