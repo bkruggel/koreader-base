@@ -106,7 +106,7 @@ static MuPdfWorker g_worker = {
 };
 
 /*
-    Client-provided lock functions for the shared MuPDF context live in
+    Client-provided locks for the shared MuPDF context live in
     wrap-mupdf.c (mupdf_new_context), which creates the root context with
     them from the start; clones made here inherit the very same locks.
 */
@@ -351,8 +351,10 @@ static void *worker_thread_func(void *arg)
             result = cookie->abort ? WORKER_ABORTED : WORKER_ERROR;
         }
 
-        /* Release the reference taken at submit time. */
-        fz_drop_display_list(w->main_ctx, job.list);
+        /* Release the reference taken at submit time using the worker's own
+         * cloned context (fz_context is strictly single-threaded in MuPDF;
+         * passing main_ctx here races with main-thread MuPDF calls). */
+        fz_drop_display_list(w->worker_ctx, job.list);
 
         pthread_mutex_lock(&w->mutex);
         if (w->job.state == WORKER_RUNNING) {
